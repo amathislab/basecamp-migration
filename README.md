@@ -64,4 +64,3 @@ Items created without the correct author's token are tracked in `id_map.json` un
 | `api_client.py` | Rate-limited Basecamp API client |
 | `id_mapper.py` | Persistent source-to-dest ID mapping |
 | `migrate.py` | Migration orchestrator |
-| `get_my_token.py` | Standalone script for remote token collection |
