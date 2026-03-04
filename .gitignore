@@ -1,0 +1,27 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Sensitive - tokens, credentials, migration state
+.env
+config.json
+id_map.json
+
+# Basecamp HTML export
+Basecamp-export-*/
+
+# OS
+.DS_Store
+
+# Standalone scripts with embedded credentials
+get_my_token.py
+
+# Test scripts
+test_authorship.py
