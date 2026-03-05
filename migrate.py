@@ -5,6 +5,7 @@ Usage:
   python migrate.py <source_project_id>
 """
 
+import re
 import sys
 import json
 from api_client import BasecampClient
@@ -53,6 +54,48 @@ class TokenRouter:
 # Metadata helpers
 # ---------------------------------------------------------------------------
 
+def sanitize_content(html: str | None) -> str:
+    """Convert bc-attachment mentions to @Name, strip opengraph embeds, keep other attachments."""
+    if not html:
+        return html or ""
+    # Mentions → @Name
+    def _mention_to_at(m):
+        fc = re.search(r'<figcaption>\s*(.*?)\s*</figcaption>', m.group(0), re.DOTALL)
+        return f'@{fc.group(1).strip()}' if fc else ''
+    html = re.sub(
+        r'<bc-attachment[^>]*content-type="application/vnd\.basecamp\.mention"[^>]*>.*?</bc-attachment>',
+        _mention_to_at, html, flags=re.DOTALL,
+    )
+    # Strip opengraph link previews (actual URLs are already in <a> tags)
+    html = re.sub(
+        r'<bc-attachment[^>]*content-type="application/vnd\.basecamp\.opengraph-embed"[^>]*>.*?</bc-attachment>',
+        '', html, flags=re.DOTALL,
+    )
+    return html
+
+
+def html_to_text(html: str) -> str:
+    """Convert HTML to readable plain text (for chat lines)."""
+    if not html:
+        return ""
+    text = html
+    text = re.sub(r'<br\s*/?>', '\n', text)
+    # <a href="url">same url</a> → url; <a href="url">text</a> → text (url)
+    def _link(m):
+        href, inner = m.group(1), re.sub(r'<[^>]+>', '', m.group(2)).strip()
+        return href if (not inner or inner == href) else f'{inner} ({href})'
+    text = re.sub(r'<a[^>]*href="([^"]*)"[^>]*>(.*?)</a>', _link, text, flags=re.DOTALL)
+    def _bq(m):
+        inner = re.sub(r'<[^>]+>', '', m.group(1)).strip()
+        return '\n'.join(f'> {line}' for line in inner.splitlines())
+    text = re.sub(r'<blockquote>(.*?)</blockquote>', _bq, text, flags=re.DOTALL)
+    text = re.sub(r'<[^>]+>', '', text)
+    for old, new in [('&amp;', '&'), ('&lt;', '<'), ('&gt;', '>'),
+                     ('&quot;', '"'), ('&#39;', "'")]:
+        text = text.replace(old, new)
+    return re.sub(r'\n{3,}', '\n\n', text).strip()
+
+
 def attribution(item: dict) -> str:
     """Generate an attribution prefix preserving original author + date."""
     author = item.get("creator", {}).get("name", "Unknown")
@@ -69,9 +112,10 @@ def with_date_note(content: str | None, item: dict) -> str:
 
 def with_attribution(content: str | None, item: dict, has_token: bool) -> str:
     """If we have the user's token, only add date. Otherwise add full attribution."""
+    content = sanitize_content(content)
     if has_token:
         return with_date_note(content, item)
-    return attribution(item) + (content or "")
+    return attribution(item) + content
 
 
 def map_user_ids(src_ids: list[int], people_map: dict[int, int]) -> list[int]:
@@ -187,11 +231,11 @@ def _migrate_todolist(src, router, mapper, src_pid, dest_pid, dest_todoset_id, t
         todos = src.get_all(url)
 
         for todo in todos:
-            _migrate_todo(src, router, mapper, src_pid, dest_pid, dest_tl_id, todo, people_map,
+            _migrate_todo(router, mapper, dest_pid, dest_tl_id, todo, people_map,
                           is_completed=bool(status_param))
 
 
-def _migrate_todo(src, router, mapper, src_pid, dest_pid, dest_tl_id, todo, people_map, is_completed):
+def _migrate_todo(router, mapper, dest_pid, dest_tl_id, todo, people_map, is_completed):
     if mapper.has("todo", todo["id"]):
         return
 
@@ -397,8 +441,12 @@ def migrate_comments(src: BasecampClient, router: TokenRouter, mapper: IDMapper,
         for src_id_str, dest_id in mappings.items():
             src_id = int(src_id_str)
             comments = src.get_all(
-                f"/buckets/{src_project_id}/recordings/{src_id}/comments.json"
+                f"/buckets/{src_project_id}/recordings/{src_id}/comments.json",
+                skip_404=True,
             )
+            if comments is None:
+                print(f"  Skipping comments for {entity_type} {src_id} (recording gone)")
+                continue
             comments.sort(key=lambda c: c["created_at"])
 
             for comment in comments:
@@ -427,10 +475,20 @@ def migrate_comments(src: BasecampClient, router: TokenRouter, mapper: IDMapper,
 # Campfire / Chat
 # ---------------------------------------------------------------------------
 
+def _campfire_text(line: dict, has_token: bool) -> str:
+    """Build plain-text campfire content (API only accepts plain text)."""
+    body = html_to_text(sanitize_content(line.get("content", "")))
+    date = line.get("created_at", "")[:10]
+    if has_token:
+        return f"[{date}]\n{body}" if body else f"[{date}]"
+    author = line.get("creator", {}).get("name", "Unknown")
+    return f"[{author}, {date}]\n{body}" if body else f"[{author}, {date}]"
+
+
 def migrate_campfire(src: BasecampClient, router: TokenRouter, mapper: IDMapper,
                      src_project_id: int, dest_project_id: int,
                      src_chat_id: int, dest_chat_id: int):
-    """Migrate campfire/chat lines (plain text only)."""
+    """Migrate campfire/chat lines (plain text only — API limitation)."""
     lines = src.get_all(f"/buckets/{src_project_id}/chats/{src_chat_id}/lines.json")
     print(f"\nMigrating {len(lines)} chat lines...")
 
@@ -442,20 +500,11 @@ def migrate_campfire(src: BasecampClient, router: TokenRouter, mapper: IDMapper,
 
         dst = router.for_creator(line)
         has_token = dst is not router.default
-        body = line.get("body", "") or ""
-
-        if has_token:
-            # Post as the original user, just add date
-            date = line.get("created_at", "")[:16].replace("T", " ")
-            text = f"[{date}] {body}"
-        else:
-            author = line.get("creator", {}).get("name", "Unknown")
-            date = line.get("created_at", "")[:16].replace("T", " ")
-            text = f"[{author}, {date}] {body}"
+        content = _campfire_text(line, has_token)
 
         dest_line = dst.post_json(
             f"/buckets/{dest_project_id}/chats/{dest_chat_id}/lines.json",
-            {"content": text},
+            {"content": content},
         )
         mapper.set("chat_line", line["id"], dest_line["id"], fallback=not has_token)
 
@@ -477,8 +526,12 @@ def migrate_boosts(src: BasecampClient, router: TokenRouter, mapper: IDMapper,
         for src_id_str, dest_id in mappings.items():
             src_id = int(src_id_str)
             boosts = src.get_all(
-                f"/buckets/{src_project_id}/recordings/{src_id}/boosts.json"
+                f"/buckets/{src_project_id}/recordings/{src_id}/boosts.json",
+                skip_404=True,
             )
+            if boosts is None:
+                print(f"  Skipping boosts for {entity_type} {src_id} (recording gone)")
+                continue
             for boost in boosts:
                 if mapper.has("boost", boost["id"]):
                     continue
@@ -505,7 +558,7 @@ def migrate_project_full(src_project_id: int):
     config = load_config()
     src = BasecampClient(SOURCE_ACCOUNT)
     dst = BasecampClient(DEST_ACCOUNT)
-    mapper = IDMapper()
+    mapper = IDMapper(f"id_map_{src_project_id}.json")
 
     # 1. Create project
     print("=" * 60)

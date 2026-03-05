@@ -73,12 +73,15 @@ class BasecampClient:
         resp.raise_for_status()
         return resp.json()
 
-    def get_all(self, path: str) -> list:
-        """Fetch all pages of a paginated endpoint."""
+    def get_all(self, path: str, skip_404: bool = True) -> list | None:
+        """Fetch all pages of a paginated endpoint.
+        If skip_404=True, returns None on 404 instead of raising."""
         items = []
         url = path if path.startswith("http") else f"{self.base_url}{path}"
         while url:
             resp = self.get(url)
+            if skip_404 and resp.status_code == 404:
+                return None
             resp.raise_for_status()
             items.extend(resp.json())
             url = resp.links.get("next", {}).get("url")

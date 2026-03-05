@@ -13,6 +13,7 @@ wheels/
 .env
 config.json
 id_map.json
+id_map_**.json
 
 # Basecamp HTML export
 Basecamp-export-*/
